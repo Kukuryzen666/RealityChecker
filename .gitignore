@@ -1,0 +1,25 @@
+# Database & Scanned Output Files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+reality_results.txt
+active_vpns.txt
+active_reality.txt
+all_reality.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
