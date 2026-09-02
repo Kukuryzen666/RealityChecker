@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-RealityChecker v2.6 - Глобальный асинхронный детектор VLESS-Reality & Аудитор базы.
-- Улучшен вывод аудита: четкое разделение между «Опознан как CDN», «Исправился и поставил свой домен»
-  и «Всё ещё Reality» без странных дублирований «был X стал X».
-- Автоматический фильтр CDN / Edge нод (Akamai, Cloudflare, Fastly, CloudFront, Google, Microsoft).
-- Отображает ПОЛНЫЙ отчет по КАЖДОМУ проверенному хосту (Reality, Свой хост, CDN, Нет SSL, Закрыт/Таймаут).
-- Детектирует ЛЮБЫЕ доменные зоны (.com, .net, .org, .io, .ru, .de, .xyz и любые другие).
-- В БД сохраняются ИСКЛЮЧИТЕЛЬНО подтвержденные Reality/VPN хосты.
-- Автоматическая проверка актуальности (Alive/Dead, смена сертификата, обновление hits).
+RealityChecker v2.7 - Глобальный асинхронный детектор VLESS-Reality & ASN/Подсеть сканер.
+- Флаг --asn <номер>: Автоматическое получение всех подсетей (CIDR) автономной системы (ASN)
+  через открытые BGP/RIPE API и их сканирование.
+- Режим скрытности и защиты от детекта:
+  * --delay <сек>: Задержка/пауза между пачками запросов (rate limiting).
+  * --shuffle: Случайное перемешивание IP-адресов (randomized scan) во избежание триггера IDS/IPS фаерволов на последовательное сканирование подсетей.
+- Аудит базы (--check-fixed): кто исправился, кто выключился, а кто сменил SNI.
+- Автоматический фильтр CDN / Edge нод (Akamai, Cloudflare, Fastly, AWS, Google).
 - AsyncIO движок (500-1000+ одновременных сокетов).
 - Полная совместимость с Windows и Linux.
 """
@@ -15,13 +15,17 @@ RealityChecker v2.6 - Глобальный асинхронный детекто
 import argparse
 import asyncio
 import ipaddress
+import json
 import os
+import random
 import re
 import socket
 import sqlite3
 import ssl
 import sys
 import time
+import urllib.request
+import urllib.error
 import warnings
 from datetime import datetime
 
@@ -78,6 +82,62 @@ CDN_KEYWORDS = (
     "googleusercontent", "1e100.net", "qrator", "ddos-guard", "gcore", "imperva",
     "incapdns", "cdngp", "stackpath", "cdn77", "selectel", "vkcdn", "a2z.com"
 )
+
+
+# ==========================================
+# ПОЛУЧЕНИЕ ПОДСЕТЕЙ ПО ASN (BGP / RIPE API)
+# ==========================================
+def fetch_asn_prefixes(asn_input: str) -> tuple[str, list[str]]:
+    """
+    Получает все IPv4 префиксы/подсети для указанного номера ASN.
+    Использует RIPE Stat API и BGPView API.
+    """
+    clean_asn = asn_input.upper().replace("AS", "").strip()
+    if not clean_asn.isdigit():
+        print(f"{CLR_RED}[!] Некорректный номер ASN: {asn_input} (должно быть число или AS12345){CLR_RESET}")
+        return clean_asn, []
+
+    print(f"[*] Запрос BGP-маршрутов для AS{clean_asn} через RIPE & BGPView API...")
+    headers = {"User-Agent": "RealityChecker/2.7 (Security Auditor)"}
+    prefixes = set()
+
+    # 1. Попытка через RIPE Stat API
+    ripe_url = f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{clean_asn}"
+    try:
+        req = urllib.request.Request(ripe_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            for item in data.get("data", {}).get("prefixes", []):
+                p = item.get("prefix")
+                if p and ":" not in p:  # Только IPv4
+                    prefixes.add(p)
+    except Exception as e:
+        pass
+
+    # 2. Если RIPE вернул мало или сбой — опрашиваем BGPView API
+    if not prefixes:
+        bgpview_url = f"https://api.bgpview.io/asn/{clean_asn}/prefixes"
+        try:
+            req = urllib.request.Request(bgpview_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                for item in data.get("data", {}).get("ipv4_prefixes", []):
+                    p = item.get("prefix")
+                    if p and ":" not in p:
+                        prefixes.add(p)
+        except Exception as e:
+            pass
+
+    # Валидация подсетей
+    valid_cidrs = []
+    for p in prefixes:
+        try:
+            net = ipaddress.ip_network(p, strict=False)
+            valid_cidrs.append(str(net))
+        except ValueError:
+            pass
+
+    return clean_asn, sorted(valid_cidrs)
 
 
 # ==========================================
@@ -408,12 +468,7 @@ def get_db_vpn_stats(conn: sqlite3.Connection):
 # ==========================================
 async def audit_fixed_hosts(conn: sqlite3.Connection, concurrency: int = 300, timeout: float = 2.5):
     """
-    Проверяет все ранее обнаруженные Reality/VPN хосты с понятным и красивым выводом:
-    - 🌐 ОПОЗНАН КАК CDN (был в базе по ошибке старой версии, теперь распознан как легитимный узел CDN)
-    - 🟢 ИСПРАВИЛСЯ (убрал чужой SNI и установил собственный сертификат)
-    - ⚪ ВЫКЛЮЧИЛСЯ (закрыл порт 443 / RST / таймаут)
-    - 🟡 СМЕНИЛ SNI (все еще Reality, но сменил маскировочный домен)
-    - 🔴 НЕ ИСПРАВИЛСЯ (все еще висит тот же чужой SNI)
+    Проверяет все ранее обнаруженные Reality/VPN хосты с понятным и красивым выводом.
     """
     cur = conn.cursor()
     cur.execute("SELECT DISTINCT ip, port, domain, tls_version, hits, first_seen FROM vpn_servers")
@@ -579,12 +634,15 @@ def clear_progress_line():
 # ==========================================
 async def async_main():
     parser = argparse.ArgumentParser(
-        description="RealityChecker 2.6: Глобальный асинхронный детектор VLESS-Reality & Аудитор базы"
+        description="RealityChecker 2.7: Глобальный асинхронный детектор VLESS-Reality & ASN/Подсеть сканер"
     )
-    parser.add_argument("target", nargs="?", default=None, help="Подсеть CIDR (например, 185.220.101.0/24) или IP")
+    parser.add_argument("target", nargs="?", default=None, help="Подсеть CIDR (например, 185.220.101.0/24) или одиночный IP")
+    parser.add_argument("--asn", type=str, default=None, help="Номер автономной системы (например: 24940 или AS24940) для сканирования ВСЕХ её подсетей")
     parser.add_argument("-p", "--ports", type=str, default="443", help="Порты через запятую (например: 443,8443,2053,2083,2087,2096)")
     parser.add_argument("-c", "--concurrency", type=int, default=500, help="Одновременных async соединений (по умолчанию: 500)")
     parser.add_argument("--timeout", type=float, default=2.5, help="Таймаут соединения в сек (по умолчанию: 2.5)")
+    parser.add_argument("--delay", type=float, default=0.0, help="Пауза/задержка в сек между запуском соединений для скрытности (например: 0.05)")
+    parser.add_argument("--shuffle", action="store_true", help="Случайно перемешать список IP (Randomized scan) для обхода детектирования IDS/IPS")
     parser.add_argument("--db", type=str, default="reality_vpn_servers.db", help="SQLite база данных (сохраняются ТОЛЬКО VPN)")
     parser.add_argument("-o", "--output", type=str, default=None, help="Файл для сохранения отчета")
     parser.add_argument("--tld", type=str, default=None, help="Фильтр по доменной зоне (например: ru, com, org). По умолчанию: ВСЕ домены")
@@ -627,18 +685,20 @@ async def async_main():
         await audit_fixed_hosts(db_conn, concurrency=args.concurrency, timeout=args.timeout)
         return
 
-    if not args.target:
+    if not args.target and not args.asn:
         total_db, active_db = get_db_vpn_stats(db_conn)
         print(f"\n{CLR_CYAN}======================================================================{CLR_RESET}")
-        print(f"{CLR_CYAN}  RealityChecker 2.6 (Global Multi-TLD & Clean Audit Detector){CLR_RESET}")
+        print(f"{CLR_CYAN}  RealityChecker 2.7 (ASN Scanning + Stealth Rate-Limiting Engine){CLR_RESET}")
         print(f"{CLR_CYAN}======================================================================{CLR_RESET}")
         print(f"  В базе данных VPN серверов: {CLR_YELLOW}{total_db}{CLR_RESET} (Активных: {CLR_GREEN}{active_db}{CLR_RESET})")
         print(f"\n{CLR_GRAY}Примеры использования:{CLR_RESET}")
-        print(f"  1. Сканировать подсеть:")
+        print(f"  1. Сканирование всей автономной системы (ASN) со скрытностью:")
+        print(f"     py {sys.argv[0]} --asn 24940 -p 443 --delay 0.02 --shuffle -c 300")
+        print(f"  2. Сканирование подсети:")
         print(f"     py {sys.argv[0]} 185.220.101.0/24 -p 443,8443 -c 600")
-        print(f"  2. Проверить аудит базы (кто исправился / выключился / CDN):")
+        print(f"  3. Проверить аудит базы (кто исправился / выключился):")
         print(f"     py {sys.argv[0]} --check-fixed")
-        print(f"  3. Экспорт активных серверов:")
+        print(f"  4. Экспорт активных серверов:")
         print(f"     py {sys.argv[0]} --export-vpn active_vpns.txt\n")
         return
 
@@ -649,19 +709,49 @@ async def async_main():
 
     tld_filter = args.tld.lower().strip().lstrip(".") if args.tld else None
 
-    # Генерация списка задач
-    try:
-        net = ipaddress.ip_network(args.target, strict=False)
-        targets = [(str(ip), p) for ip in net.hosts() for p in ports]
-    except ValueError:
-        targets = [(args.target, p) for p in ports]
+    # Генерация списка целей (IP, Port)
+    targets = []
+    
+    # Режим А: Сканирование по ASN (--asn)
+    if args.asn:
+        clean_asn, prefixes = fetch_asn_prefixes(args.asn)
+        if not prefixes:
+            print(f"{CLR_RED}[-] Не удалось обнаружить маршрутизируемые подсети для AS{clean_asn}.{CLR_RESET}")
+            return
+        print(f"{CLR_GREEN}[+] Для AS{clean_asn} найдено {len(prefixes)} подсетей (CIDR).{CLR_RESET}")
+        
+        # Разворачиваем все подсети в список хостов
+        for cidr in prefixes:
+            try:
+                net = ipaddress.ip_network(cidr, strict=False)
+                # Если префикс слишком огромный (> /16, например /12), берем первые подсети или уведомляем
+                for ip in net.hosts():
+                    for p in ports:
+                        targets.append((str(ip), p))
+            except Exception:
+                pass
+    # Режим Б: Одиночная подсеть / IP
+    elif args.target:
+        try:
+            net = ipaddress.ip_network(args.target, strict=False)
+            targets = [(str(ip), p) for ip in net.hosts() for p in ports]
+        except ValueError:
+            targets = [(args.target, p) for p in ports]
 
     total_tasks = len(targets)
+    if total_tasks == 0:
+        print(f"{CLR_RED}[!] Нет хостов для сканирования.{CLR_RESET}")
+        return
+
+    # Перемешивание хостов при флаге --shuffle (Randomized IP scan)
+    if args.shuffle:
+        random.shuffle(targets)
+
     total_db, active_db = get_db_vpn_stats(db_conn)
 
     print(f"\n{CLR_CYAN}======================================================================{CLR_RESET}")
-    print(f"{CLR_CYAN}  REALITYCHECKER 2.6: ГЛОБАЛЬНЫЙ СКАНЕР ({len(targets)} целей){CLR_RESET}")
-    print(f"{CLR_CYAN}  Порты: {ports} | Concurrency: {args.concurrency} | CDN-Фильтр: ВКЛЮЧЕН{CLR_RESET}")
+    print(f"{CLR_CYAN}  REALITYCHECKER 2.7: СКАНИРОВАНИЕ ({total_tasks} целей){CLR_RESET}")
+    print(f"{CLR_CYAN}  Порты: {ports} | Concurrency: {args.concurrency} | Stealth Delay: {args.delay}s | Shuffle: {args.shuffle}{CLR_RESET}")
     print(f"{CLR_CYAN}  (В базу сохраняются ИСКЛЮЧИТЕЛЬНО подтвержденные Reality/VPN){CLR_RESET}")
     print(f"{CLR_CYAN}======================================================================{CLR_RESET}\n")
 
@@ -676,6 +766,10 @@ async def async_main():
 
     async def worker(ip: str, port: int):
         nonlocal scanned_count
+        # Применяем настраиваемый таймаут / задержку между соединениями для скрытности
+        if args.delay > 0:
+            await asyncio.sleep(args.delay * random.uniform(0.7, 1.3))
+
         async with semaphore:
             res = await scan_host_tls(ip, port, args.timeout, ssl_ctx)
             scanned_count += 1
@@ -810,7 +904,7 @@ async def async_main():
     if args.output and found_vpn_hosts:
         try:
             with open(args.output, "w", encoding="utf-8") as f:
-                f.write(f"REALITYCHECKER 2.6 VPN REPORT - {datetime.now().isoformat()}\n")
+                f.write(f"REALITYCHECKER 2.7 VPN REPORT - {datetime.now().isoformat()}\n")
                 f.write("=" * 60 + "\n\n")
                 for h in found_vpn_hosts:
                     f.write(f"{h['ip']}:{h['port']} (TLS: {h['tls_version']}) [⚡ REALITY/VPN]\n")
